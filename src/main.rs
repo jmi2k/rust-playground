@@ -1,183 +1,126 @@
-use std::fmt::Display;
+#![feature(isqrt)]
+#![feature(new_uninit)]
 
-type Screen = [[(u16, Kind); 8]; 8];
+mod gfx;
 
-const CLEAN_SCREEN: Screen = [[(0, Kind::Initial); 8]; 8];
+use std::{
+    marker::PhantomData,
+    mem::{self, MaybeUninit},
+    sync::Arc,
+};
 
-#[derive(Clone, Copy, Debug)]
-struct Quad {
-    color: u16,
-    x0: u16,
-    y0: u16,
-    width: u8,
-    height: u8,
+use bytemuck::Pod;
+use gfx::Gfx;
+use wgpu::{Buffer, BufferDescriptor, BufferUsages};
+use winit::{
+    dpi::PhysicalSize,
+    event_loop::{ControlFlow, EventLoop},
+    window::WindowBuilder,
+};
+
+type QuadRef = u64;
+
+// Inspired by
+// https://nickmcd.me/2021/04/04/high-performance-voxel-engine/#voxel-data-rendering-systems,
+// but with a buddy allocator instead of fixed-size buckets.
+#[derive(Debug)]
+pub struct Buddy<T: Pod> {
+    buffer: Buffer,
+    alloc_tree: Box<[u8]>,
+
+    // `buffer` holds items of type T
+    _casper: PhantomData<T>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Kind {
-    Initial,
-    Inside,
-    Final,
-    Single,
-}
+impl<T: Pod> Buddy<T> {
+    const STRIDE: usize = mem::size_of::<T>();
+    const USED: u8 = u8::MAX;
 
-impl Display for Kind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let str = match *self {
-            Self::Initial => "██",
-            Self::Inside => "░░",
-            Self::Final => "▒▒",
-            Self::Single => "█▒",
+    pub fn capacity(&self) -> usize {
+        (self.buffer.size() / Self::STRIDE as u64) as _
+    }
+
+    pub fn new(gfx: &Gfx, capacity: usize, min_order: u8) -> Self {
+        let capacity = capacity.next_power_of_two();
+        let max_order = capacity.ilog2() as u8;
+
+        debug_assert!(
+            max_order >= min_order,
+            "minimum order too big for requested capacity"
+        );
+
+        // Allocate and initialize tree to keep track of used/free blocks
+        let tree_height = max_order - min_order + 1;
+        let num_leaves = 1 << tree_height;
+        let mut uninit_alloc_tree = Box::new_zeroed_slice(num_leaves);
+
+        for level in 0..tree_height {
+            let order = MaybeUninit::new(max_order - level);
+            let len = 1 << level;
+            uninit_alloc_tree[len..2 * len].fill(order);
+        }
+
+        // Allocate buffer to hold items
+        let descriptor = BufferDescriptor {
+            label: None,
+            size: Self::STRIDE as u64 * capacity as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         };
 
-        f.write_str(str)
-    }
-}
+        let buffer = gfx.device.create_buffer(&descriptor);
 
-fn main() {
-    let mut mesh = vec![
-        Quad { color: 3, x0: 0, y0: 0, width: 0, height: 0 },
-        Quad { color: 1, x0: 1, y0: 0, width: 4, height: 0 },
-        Quad { color: 4, x0: 6, y0: 0, width: 1, height: 0 },
-
-        Quad { color: 3, x0: 0, y0: 1, width: 0, height: 0 },
-        Quad { color: 1, x0: 1, y0: 1, width: 4, height: 0 },
-        Quad { color: 4, x0: 6, y0: 1, width: 1, height: 0 },
-
-        Quad { color: 3, x0: 0, y0: 2, width: 0, height: 0 },
-        Quad { color: 1, x0: 1, y0: 2, width: 0, height: 0 },
-        Quad { color: 1, x0: 4, y0: 2, width: 1, height: 0 },
-        Quad { color: 4, x0: 6, y0: 2, width: 1, height: 0 },
-
-        Quad { color: 3, x0: 0, y0: 3, width: 0, height: 0 },
-        Quad { color: 1, x0: 1, y0: 3, width: 1, height: 0 },
-        Quad { color: 2, x0: 5, y0: 3, width: 2, height: 0 },
-
-        Quad { color: 3, x0: 0, y0: 4, width: 0, height: 0 },
-        Quad { color: 1, x0: 1, y0: 4, width: 2, height: 0 },
-        Quad { color: 2, x0: 4, y0: 4, width: 3, height: 0 },
-
-        Quad { color: 3, x0: 0, y0: 5, width: 0, height: 0 },
-        Quad { color: 1, x0: 1, y0: 5, width: 1, height: 0 },
-        Quad { color: 1, x0: 5, y0: 5, width: 2, height: 0 },
-
-        Quad { color: 3, x0: 0, y0: 6, width: 0, height: 0 },
-        Quad { color: 1, x0: 1, y0: 6, width: 2, height: 0 },
-        Quad { color: 2, x0: 4, y0: 6, width: 3, height: 0 },
-
-        Quad { color: 3, x0: 0, y0: 7, width: 0, height: 0 },
-        Quad { color: 1, x0: 1, y0: 7, width: 2, height: 0 },
-        Quad { color: 2, x0: 4, y0: 7, width: 3, height: 0 },
-    ];
-
-    println!();
-    println!("1D greedy meshing ({} rects)", mesh.len());
-    println!();
-
-    let mut screen = CLEAN_SCREEN;
-    render(&mesh, &mut screen);
-    display(&screen);
-
-    greedy2d(&mut mesh);
-
-    println!();
-    println!("2D greedy meshing ({} rects)", mesh.len());
-    println!();
-
-    let mut screen = CLEAN_SCREEN;
-
-    render(&mesh, &mut screen);
-    display(&screen);
-}
-
-fn render(mesh: &[Quad], screen: &mut Screen) {
-    for &Quad { color, x0, y0, width, height } in mesh.iter() {
-        for y in y0 ..= y0 + height as u16 {
-        for x in x0 ..= x0 + width as u16 {
-            let mut kind = Kind::Inside;
-            if (x, y) == (x0, y0) { kind = Kind::Initial; }
-            if (x, y) == (x0 + width as u16, y0 + height as u16) { kind = Kind::Final; }
-            if (width, height) == (0, 0) { kind = Kind::Single; }
-            screen[y as usize][x as usize] = (color, kind);
-        }
-        }
-    }
-}
-
-fn display(screen: &Screen) {
-    for line in screen {
-        for (color, kind) in line {
-            if *color == 0 {
-                print!("\x1B[1;3{}m  \x1B[0m", color);
-            } else {
-                print!("\x1B[1;3{}m{}\x1B[0m", color, kind);
-            }
-        }
-
-        println!();
-    }
-}
-
-#[inline(never)]
-fn greedy2d(mesh: &mut Vec<Quad>) {
-    let mut dest = 0;
-    let mut back = 0;
-    let mut lead = 0;
-
-    loop {
-        // 1: Advance lead
-        // 2: Advance back
-        // 3: Merge step
-        // 4: End condition
-
-        if lead == mesh.len() {
-            if back != lead {
-                // 2
-                *unsafe { mesh.get_unchecked_mut(dest) } = *unsafe { mesh.get_unchecked(back) };
-                dest += 1;
-                back += 1;
-                continue;
-            } else {
-                // 4
-                break;
-            }
-        }
-
-        let b = *unsafe { mesh.get_unchecked(back) };
-        let l = *unsafe { mesh.get_unchecked(lead) };
-        let d = unsafe { mesh.get_unchecked_mut(dest) };
-        let Δy = l.y0 - b.y0 - b.height as u16;
-
-        if Δy == 0 {
-            // 1
-            lead += 1;
-        } else if Δy > 1 {
-            // 2
-            *d = b;
-            dest += 1;
-            back += 1;
-        } else if b.x0 > l.x0 {
-            // 1
-            lead += 1;
-        } else if l.x0 > b.x0 {
-            // 2
-            *d = b;
-            dest += 1;
-            back += 1;
-        } else if b.width == l.width {
-            // 3
-            let new_height = b.height + 1;
-            unsafe { mesh.get_unchecked_mut(lead) }.y0 -= new_height as u16;
-            unsafe { mesh.get_unchecked_mut(lead) }.height = new_height;
-            back += 1;
-            lead += 1;
-        } else {
-            // 2
-            *d = b;
-            dest += 1;
-            back += 1;
+        Self {
+            buffer,
+            alloc_tree: unsafe { uninit_alloc_tree.assume_init() },
+            _casper: PhantomData,
         }
     }
 
-    mesh.truncate(dest);
+    pub fn alloc(&mut self, len: usize) -> Option<usize> {
+        let len = len.next_power_of_two();
+        let order = len.ilog2() as u8;
+
+        // Early return if request cannot be satisfied
+        if self.alloc_tree[1] < order {
+            return None;
+        }
+
+        println!("Allocating block {} elements long (order {})", len, order);
+        todo!()
+    }
+
+    pub fn free(&mut self, len: usize) {
+        todo!()
+    }
+
+    pub fn write(&mut self, gfx: &Gfx, data: &[T]) {
+        todo!()
+    }
+
+    pub fn load(&mut self, gfx: &Gfx, data: &[T]) {
+        todo!()
+    }
+}
+
+#[pollster::main]
+async fn main() {
+    let event_loop = EventLoop::new().unwrap();
+    event_loop.set_control_flow(ControlFlow::Poll);
+
+    let window = Arc::new(
+        WindowBuilder::new()
+            .with_title("aXial")
+            .with_inner_size(PhysicalSize::new(854, 480))
+            .build(&event_loop)
+            .unwrap(),
+    );
+
+    let gfx = Gfx::new(window).await;
+    //let mut quad_buddy = Buddy::<QuadRef>::new(&gfx, 0x200_0000, 5);
+    let mut quad_buddy = Buddy::<QuadRef>::new(&gfx, 4, 0);
+    println!("{:?}", quad_buddy);
+    quad_buddy.alloc(3);
+
+    let _ = event_loop.run(|_, _| {});
 }
