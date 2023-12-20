@@ -88,7 +88,7 @@ impl<'win> Gfx<'win> {
             _ => {
                 // No other present mode than the ones listed is used
                 unreachable!()
-            },
+            }
         };
 
         self.surface.configure(&self.device, &self.config);

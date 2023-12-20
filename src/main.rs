@@ -1,107 +1,22 @@
-#![feature(isqrt)]
+#![feature(iter_collect_into)]
 #![feature(new_uninit)]
 
+mod buddy;
 mod gfx;
 
-use std::{
-    marker::PhantomData,
-    mem::{self, MaybeUninit},
-    sync::Arc,
-};
+use std::{mem, sync::Arc, time::Instant};
 
-use bytemuck::Pod;
 use gfx::Gfx;
-use wgpu::{Buffer, BufferDescriptor, BufferUsages};
+use rand::Rng;
 use winit::{
     dpi::PhysicalSize,
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
 
+use crate::buddy::Buddy;
+
 type QuadRef = u64;
-
-// Inspired by
-// https://nickmcd.me/2021/04/04/high-performance-voxel-engine/#voxel-data-rendering-systems,
-// but with a buddy allocator instead of fixed-size buckets.
-#[derive(Debug)]
-pub struct Buddy<T: Pod> {
-    buffer: Buffer,
-    alloc_tree: Box<[u8]>,
-
-    // `buffer` holds items of type T
-    _casper: PhantomData<T>,
-}
-
-impl<T: Pod> Buddy<T> {
-    const STRIDE: usize = mem::size_of::<T>();
-    const USED: u8 = u8::MAX;
-
-    pub fn capacity(&self) -> usize {
-        (self.buffer.size() / Self::STRIDE as u64) as _
-    }
-
-    pub fn new(gfx: &Gfx, capacity: usize, min_order: u8) -> Self {
-        let capacity = capacity.next_power_of_two();
-        let max_order = capacity.ilog2() as u8;
-
-        debug_assert!(
-            max_order >= min_order,
-            "minimum order too big for requested capacity"
-        );
-
-        // Allocate and initialize tree to keep track of used/free blocks
-        let tree_height = max_order - min_order + 1;
-        let num_leaves = 1 << tree_height;
-        let mut uninit_alloc_tree = Box::new_zeroed_slice(num_leaves);
-
-        for level in 0..tree_height {
-            let order = MaybeUninit::new(max_order - level);
-            let len = 1 << level;
-            uninit_alloc_tree[len..2 * len].fill(order);
-        }
-
-        // Allocate buffer to hold items
-        let descriptor = BufferDescriptor {
-            label: None,
-            size: Self::STRIDE as u64 * capacity as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        };
-
-        let buffer = gfx.device.create_buffer(&descriptor);
-
-        Self {
-            buffer,
-            alloc_tree: unsafe { uninit_alloc_tree.assume_init() },
-            _casper: PhantomData,
-        }
-    }
-
-    pub fn alloc(&mut self, len: usize) -> Option<usize> {
-        let len = len.next_power_of_two();
-        let order = len.ilog2() as u8;
-
-        // Early return if request cannot be satisfied
-        if self.alloc_tree[1] < order {
-            return None;
-        }
-
-        println!("Allocating block {} elements long (order {})", len, order);
-        todo!()
-    }
-
-    pub fn free(&mut self, len: usize) {
-        todo!()
-    }
-
-    pub fn write(&mut self, gfx: &Gfx, data: &[T]) {
-        todo!()
-    }
-
-    pub fn load(&mut self, gfx: &Gfx, data: &[T]) {
-        todo!()
-    }
-}
 
 #[pollster::main]
 async fn main() {
@@ -117,10 +32,62 @@ async fn main() {
     );
 
     let gfx = Gfx::new(window).await;
-    //let mut quad_buddy = Buddy::<QuadRef>::new(&gfx, 0x200_0000, 5);
-    let mut quad_buddy = Buddy::<QuadRef>::new(&gfx, 4, 0);
-    println!("{:?}", quad_buddy);
-    quad_buddy.alloc(3);
+
+    // let capacity = 0x200_0000;
+    let size = 0x1000_0000;
+    let capacity = size / mem::size_of::<QuadRef>();
+    let min_order = 8;
+
+    println!("{} bytes", size);
+    println!("{} entries", capacity);
+    println!("{} minimum alloc", 1 << min_order);
+    println!();
+
+    // Time buddy creation
+    let then = Instant::now();
+    let untouched_quad_buddy = Buddy::<QuadRef>::new(&gfx, capacity, min_order);
+    let mut quad_buddy = Buddy::<QuadRef>::new(&gfx, capacity, min_order);
+    println!("init\t\t{:?}", then.elapsed());
+
+    // Perform as many allocations as possible
+    // (minimum size allocations)
+    let mut handles = Vec::with_capacity(capacity >> min_order);
+
+    // Time single buddy allocation
+    let then = Instant::now();
+    let handle = quad_buddy.alloc(1 << min_order).unwrap();
+    println!("alloc 1\t\t{:?}", then.elapsed());
+
+    // Time single buddy free
+    let then = Instant::now();
+    quad_buddy.free(handle);
+    println!("free 1\t\t{:?}", then.elapsed());
+
+    // Time largest buddy allocation run
+    let then = Instant::now();
+    for _ in 0..handles.capacity() {
+        if let Some(handle) = quad_buddy.alloc(1 << min_order) {
+            handles.push(handle);
+        } else {
+            // All those allocations must succeed
+            unreachable!();
+        }
+    }
+    println!("alloc {}\t{:?}", handles.capacity() - 1, then.elapsed());
+
+    // Any further allocation must fail
+    assert!(quad_buddy.alloc(1).is_none());
+
+    // Time buddy free
+    let then = Instant::now();
+    let capacity = handles.capacity();
+    for handle in handles {
+        quad_buddy.free(handle);
+    }
+    println!("free {}\t{:?}", capacity, then.elapsed());
+
+    // The buddy must be left in the same state as it was after its creation
+    assert!(untouched_quad_buddy.check_is_same(&quad_buddy));
 
     let _ = event_loop.run(|_, _| {});
 }
